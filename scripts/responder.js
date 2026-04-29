@@ -143,7 +143,7 @@ async function generateReply(userMessage, conversationHistory, negocio, paginaNo
       "X-Title": "FB AI Responder"
     },
     body: JSON.stringify({
-      model: "mistralai/mistral-7b-instruct:free",
+      model: "openrouter/free",
       max_tokens: 300,
       messages: [
         {
