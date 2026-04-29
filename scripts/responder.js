@@ -239,6 +239,13 @@ async function main() {
       console.log(`   Conversaciones encontradas: ${conversations.length}`);
 
       for (const conv of conversations) {
+        // DEBUG: mostrar estado de cada conversación
+        const dbgMsgs = conv.messages?.data || [];
+        const dbgLast = dbgMsgs[0];
+        const dbgRecent = dbgMsgs.slice(0, 3).map(m => `${m.from?.id}(${m.from?.name?.substring(0,10)})`).join(', ');
+        const dbgAge = dbgLast ? Math.round((Date.now() - new Date(dbgLast.created_time)) / 3600000) : '?';
+        console.log(`   🔍 Conv ${conv.id.substring(0,20)}... | últimos: [${dbgRecent}] | hace ${dbgAge}h | pageId: ${page.pageId}`);
+
         if (!needsReply(conv, page.pageId)) continue;
 
         const messages = conv.messages?.data || [];
