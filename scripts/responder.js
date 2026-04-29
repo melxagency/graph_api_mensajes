@@ -97,7 +97,7 @@ async function fbPost(path, token, body) {
  */
 async function getConversations(pageId, token) {
   const data = await fbGet(
-    `${pageId}/conversations?fields=id,updated_time,messages{id,message,from,created_time,to}&limit=20`,
+    `${pageId}/conversations?fields=id,updated_time,messages.limit(10){id,message,from,created_time,to}&limit=20`,
     token
   );
   return data.data || [];
@@ -108,15 +108,12 @@ async function getConversations(pageId, token) {
  * La Graph API devuelve mensajes de más antiguo a más reciente,
  * por lo que el ÚLTIMO elemento del array es el mensaje más reciente.
  */
-function needsReply(conversation, pageId, repliedSet) {
+function needsReply(conversation, pageId, repliedMap) {
   const messages = conversation.messages?.data || [];
   if (messages.length === 0) return false;
 
   // Si ya lo procesamos en esta ejecución (cache en memoria)
   if (REPLIED_CACHE.has(conversation.id)) return false;
-
-  // Si ya fue respondido en una ejecución anterior (persistido en Supabase)
-  if (repliedSet.has(conversation.id)) return false;
 
   // El más reciente es el ÚLTIMO del array
   const lastMsg = messages[messages.length - 1];
@@ -129,6 +126,14 @@ function needsReply(conversation, pageId, repliedSet) {
   const hoursOld = (Date.now() - msgTime) / (1000 * 60 * 60);
   if (hoursOld > 23) return false;
 
+  // Si ya fue respondido antes, verificar si el usuario escribió DESPUÉS de esa respuesta
+  // Si escribió después → debe responder de nuevo
+  if (repliedMap.has(conversation.id)) {
+    const lastRepliedAt = repliedMap.get(conversation.id);
+    const lastUserMsgTime = new Date(lastMsg.created_time).getTime();
+    if (lastUserMsgTime <= lastRepliedAt) return false; // No hay mensajes nuevos del usuario
+  }
+
   return true;
 }
 
@@ -140,17 +145,23 @@ function needsReply(conversation, pageId, repliedSet) {
  */
 async function loadRepliedConversations() {
   try {
-    // Traemos los conversation_id respondidos en las últimas 23 horas
+    // Traemos conversation_id y replied_at de las últimas 23 horas
     const since = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
     const data = await supabaseQuery(
-      `ai_replies_log?select=conversation_id&replied_at=gte.${since}`
+      `ai_replies_log?select=conversation_id,replied_at&replied_at=gte.${since}&order=replied_at.desc`
     );
-    const ids = new Set(data.map(r => r.conversation_id));
-    console.log(`✅ Conversaciones ya respondidas cargadas: ${ids.size}`);
-    return ids;
+    // Map: conversation_id -> timestamp de la última respuesta de la IA
+    const repliedMap = new Map();
+    for (const r of data) {
+      if (!repliedMap.has(r.conversation_id)) {
+        repliedMap.set(r.conversation_id, new Date(r.replied_at).getTime());
+      }
+    }
+    console.log(`✅ Conversaciones ya respondidas cargadas: ${repliedMap.size}`);
+    return repliedMap;
   } catch (e) {
     console.warn("⚠️  No se pudo cargar ai_replies_log:", e.message);
-    return new Set();
+    return new Map();
   }
 }
 
@@ -275,7 +286,7 @@ async function main() {
   }
 
   // 2. Cargar conversaciones ya respondidas desde Supabase
-  const repliedSet = await loadRepliedConversations();
+  const repliedMap = await loadRepliedConversations();
 
   let totalReplied = 0;
   let totalErrors = 0;
@@ -295,10 +306,10 @@ async function main() {
         const dbgLast = dbgMsgs[dbgMsgs.length - 1]; // más reciente = último
         const dbgRecent = dbgMsgs.slice(-3).map(m => `${m.from?.id}(${m.from?.name?.substring(0,10)})`).join(', ');
         const dbgAge = dbgLast ? Math.round((Date.now() - new Date(dbgLast.created_time)) / 3600000) : '?';
-        const dbgNeedsReply = String(dbgLast?.from?.id) !== String(page.pageId) && dbgAge <= 23 && !repliedSet.has(conv.id) && !REPLIED_CACHE.has(conv.id);
+        const dbgNeedsReply = String(dbgLast?.from?.id) !== String(page.pageId) && dbgAge <= 23 && !repliedMap.has(conv.id) && !REPLIED_CACHE.has(conv.id);
         console.log(`   🔍 Conv ${conv.id.substring(0,20)}... | recientes: [${dbgRecent}] | hace ${dbgAge}h | ${dbgNeedsReply ? '✅ PENDIENTE' : '⏭ skip'}`);
 
-        if (!needsReply(conv, page.pageId, repliedSet)) continue;
+        if (!needsReply(conv, page.pageId, repliedMap)) continue;
 
         const messages = conv.messages?.data || [];
 
