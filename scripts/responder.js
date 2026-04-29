@@ -132,8 +132,7 @@ async function generateReply(userMessage, conversationHistory, negocio, paginaNo
     .slice(0, 6)
     .reverse()
     .map((m) => `${m.from?.name || "Usuario"}: ${m.message}`)
-    .join("
-");
+    .join("\n");
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -153,12 +152,7 @@ async function generateReply(userMessage, conversationHistory, negocio, paginaNo
         },
         {
           role: "user",
-          content: `Historial:
-${historyText}
-
-Último mensaje: "${userMessage}"
-
-Responde:`
+          content: `Historial:\n${historyText}\n\nÚltimo mensaje: "${userMessage}"\n\nResponde:`
         }
       ]
     })
