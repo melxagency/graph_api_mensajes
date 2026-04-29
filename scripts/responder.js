@@ -100,34 +100,27 @@ async function getConversations(pageId, token) {
 }
 
 /**
- * Verifica si la conversación necesita respuesta:
- * - El último mensaje debe ser del usuario (no de la página)
- * - No debe haber sido procesada ya en esta ejecución
- * - El mensaje no debe tener más de 48 horas
+ * Verifica si la conversación necesita respuesta.
+ * La Graph API devuelve mensajes de más antiguo a más reciente,
+ * por lo que el ÚLTIMO elemento del array es el mensaje más reciente.
  */
 function needsReply(conversation, pageId) {
   const messages = conversation.messages?.data || [];
   if (messages.length === 0) return false;
 
-  // Los mensajes vienen ordenados del más reciente al más antiguo
-  const lastMsg = messages[0];
-
-  // Verificar si algún mensaje reciente fue enviado por la página (ya respondido)
-  // Revisamos los últimos 3 mensajes para detectar si la página ya respondió
-  const recentMessages = messages.slice(0, 3);
-  const pageAlreadyReplied = recentMessages.some(
-    (m) => String(m.from?.id) === String(pageId)
-  );
-  if (pageAlreadyReplied) return false;
-
   // Si ya lo procesamos en esta ejecución
   if (REPLIED_CACHE.has(conversation.id)) return false;
 
-  // Ignorar mensajes muy viejos (más de 48 horas)
+  // El más reciente es el ÚLTIMO del array
+  const lastMsg = messages[messages.length - 1];
+
+  // Si el último mensaje lo envió la propia página, ya fue respondido
+  if (String(lastMsg.from?.id) === String(pageId)) return false;
+
+  // Ignorar mensajes muy viejos (más de 7 días = 168 horas)
   const msgTime = new Date(lastMsg.created_time).getTime();
-  const now = Date.now();
-  const hoursOld = (now - msgTime) / (1000 * 60 * 60);
-  if (hoursOld > 48) return false;
+  const hoursOld = (Date.now() - msgTime) / (1000 * 60 * 60);
+  if (hoursOld > 168) return false;
 
   return true;
 }
@@ -241,15 +234,16 @@ async function main() {
       for (const conv of conversations) {
         // DEBUG: mostrar estado de cada conversación
         const dbgMsgs = conv.messages?.data || [];
-        const dbgLast = dbgMsgs[0];
-        const dbgRecent = dbgMsgs.slice(0, 3).map(m => `${m.from?.id}(${m.from?.name?.substring(0,10)})`).join(', ');
+        const dbgLast = dbgMsgs[dbgMsgs.length - 1]; // más reciente = último
+        const dbgRecent = dbgMsgs.slice(-3).map(m => `${m.from?.id}(${m.from?.name?.substring(0,10)})`).join(', ');
         const dbgAge = dbgLast ? Math.round((Date.now() - new Date(dbgLast.created_time)) / 3600000) : '?';
-        console.log(`   🔍 Conv ${conv.id.substring(0,20)}... | últimos: [${dbgRecent}] | hace ${dbgAge}h | pageId: ${page.pageId}`);
+        const dbgNeedsReply = String(dbgLast?.from?.id) !== String(page.pageId) && dbgAge <= 168;
+        console.log(`   🔍 Conv ${conv.id.substring(0,20)}... | recientes: [${dbgRecent}] | hace ${dbgAge}h | ${dbgNeedsReply ? '✅ PENDIENTE' : '⏭ skip'}`);
 
         if (!needsReply(conv, page.pageId)) continue;
 
         const messages = conv.messages?.data || [];
-        const lastMsg = messages[0];
+        const lastMsg = messages[messages.length - 1]; // más reciente = último
         const userMessage = lastMsg.message;
 
         if (!userMessage || userMessage.trim() === "") continue;
