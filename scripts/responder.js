@@ -143,7 +143,7 @@ async function generateReply(userMessage, conversationHistory, negocio, paginaNo
       "X-Title": "FB AI Responder"
     },
     body: JSON.stringify({
-      model: "meta-llama/llama-3.3-70b-instruct:free",
+      model: "mistralai/mistral-7b-instruct:free",
       max_tokens: 300,
       messages: [
         {
@@ -159,7 +159,8 @@ async function generateReply(userMessage, conversationHistory, negocio, paginaNo
   });
 
   const data = await response.json();
-  if (data.error) throw new Error(`OpenRouter error: ${data.error.message}`);
+  if (data.error) throw new Error(`OpenRouter error: ${JSON.stringify(data.error)}`);
+  if (!data.choices?.[0]?.message?.content) throw new Error(`OpenRouter respuesta inesperada: ${JSON.stringify(data)}`);
   return data.choices[0].message.content.trim();
 }
 
