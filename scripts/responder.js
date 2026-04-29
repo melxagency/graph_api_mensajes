@@ -23,16 +23,17 @@ async function supabaseQuery(path) {
 }
 
 /**
- * Trae todas las páginas activas con token + info del cliente (negocio)
- * JOIN: pages_services → paginas → contratos_servicios → clientes
+ * Trae todas las páginas activas con token + info completa del cliente
+ * JOIN: pages_services → pages → contratos_servicios → clientes
+ * Incluye: negocio, contacto, email, contexto del cliente
  */
 async function getPagesWithContext() {
-  // Traemos pages_services con fecha_termino nula o futura (contrato activo)
+  // Traemos pages_services activos (fecha_termino nula) con toda la info del cliente
   const services = await supabaseQuery(
-    `pages_services?select=id,id_pagina,id_contrato,contratos_servicios(id,id_cliente,clientes(id,cliente,negocio,contacto))&fecha_termino=is.null&order=id`
+    `pages_services?select=id,id_pagina,id_contrato,contratos_servicios(id,id_cliente,clientes(id,cliente,negocio,contacto,email,contexto))&fecha_termino=is.null&order=id`
   );
 
-  // Traemos la tabla de páginas para obtener el token y el id_page de Facebook
+  // Traemos la tabla pages para obtener token e id_page de Facebook
   const paginas = await supabaseQuery(
     `pages?select=id,id_page,token,nombre,date_expire_token`
   );
@@ -60,11 +61,14 @@ async function getPagesWithContext() {
     result.push({
       serviceId: svc.id,
       paginaId: pagina.id,
-      pageId: String(pagina.id_page),  // ID real de Facebook
+      pageId: String(pagina.id_page),
       token: pagina.token,
       nombrePagina: pagina.nombre,
-      negocio: cliente?.negocio || cliente?.cliente || "negocio en Facebook",
       clienteNombre: cliente?.cliente || "",
+      negocio: cliente?.negocio || cliente?.cliente || "negocio en Facebook",
+      contacto: cliente?.contacto || "",   // WhatsApp / teléfono
+      email: cliente?.email || "",          // Email de contacto
+      contexto: cliente?.contexto || "",    // Info adicional: qué tiene, qué no tiene, restricciones
     });
   }
 
@@ -127,12 +131,35 @@ function needsReply(conversation, pageId) {
 
 // ─── OpenRouter AI (gratis con modelos gratuitos) ─────────────────────────────
 
-async function generateReply(userMessage, conversationHistory, negocio, paginaNombre) {
+async function generateReply(userMessage, conversationHistory, page) {
+  const { nombrePagina, negocio, contacto, email, contexto } = page;
+
   const historyText = conversationHistory
     .slice(0, 6)
     .reverse()
     .map((m) => `${m.from?.name || "Usuario"}: ${m.message}`)
     .join("\n");
+
+  // Construir contexto de contacto para que la IA lo use correctamente
+  const contactoInfo = [
+    contacto ? `WhatsApp/Teléfono: ${contacto}` : "",
+    email ? `Email: ${email}` : "",
+  ].filter(Boolean).join(" | ");
+
+  const systemPrompt = `Eres el asistente virtual de la página de Facebook "${nombrePagina}".
+Negocio: ${negocio}.
+${contactoInfo ? `Datos de contacto del negocio: ${contactoInfo}.` : ""}
+${contexto ? `Información importante sobre el negocio: ${contexto}.` : ""}
+
+INSTRUCCIONES:
+- Responde de forma amable, profesional y concisa (máximo 3 oraciones)
+- Responde siempre en el mismo idioma del mensaje del usuario
+- Si el usuario pregunta cómo contactar, proporciona el WhatsApp o email disponible
+- Si preguntan por precios o disponibilidad específica que no está en el contexto, invítalos a contactar por WhatsApp/email
+- No inventes información que no esté en el contexto dado
+- Sé cálido y útil como un buen agente de atención al cliente
+- Si es un saludo, responde con saludo y pregunta en qué puedes ayudar
+- No menciones que eres IA a menos que te lo pregunten directamente`;
 
   const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
@@ -148,7 +175,7 @@ async function generateReply(userMessage, conversationHistory, negocio, paginaNo
       messages: [
         {
           role: "system",
-          content: `Eres el asistente virtual de la página de Facebook "${paginaNombre}". El negocio es: ${negocio}. INSTRUCCIONES: Responde de forma amable, profesional y concisa (máximo 3 oraciones). Responde siempre en el mismo idioma del mensaje del usuario. Si preguntan por precios o disponibilidad específica que no conoces, invítalos a contactar directamente. No inventes información. Sé cálido y útil. Si es un saludo, responde con saludo y pregunta en qué puedes ayudar. No menciones que eres IA a menos que te lo pregunten.`
+          content: systemPrompt
         },
         {
           role: "user",
@@ -260,8 +287,7 @@ async function main() {
           const reply = await generateReply(
             userMessage,
             messages,
-            page.negocio,
-            page.nombrePagina
+            page
           );
           console.log(`   🤖 Respuesta IA: "${reply.substring(0, 80)}..."`);
 
