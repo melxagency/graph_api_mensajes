@@ -160,8 +160,20 @@ async function generateReply(userMessage, conversationHistory, negocio, paginaNo
 
   const data = await response.json();
   if (data.error) throw new Error(`OpenRouter error: ${JSON.stringify(data.error)}`);
-  if (!data.choices?.[0]?.message?.content) throw new Error(`OpenRouter respuesta inesperada: ${JSON.stringify(data)}`);
-  return data.choices[0].message.content.trim();
+  const msgContent = data.choices?.[0]?.message?.content;
+  // Algunos modelos devuelven content:null cuando el reasoning excede el límite
+  // En ese caso intentamos extraer del reasoning o usamos respuesta genérica
+  if (!msgContent) {
+    const reasoning = data.choices?.[0]?.message?.reasoning;
+    if (reasoning && reasoning.length > 10) {
+      // Extraer la última oración del reasoning como respuesta
+      const sentences = reasoning.split(/[.!?]/).filter(s => s.trim().length > 10);
+      const lastSentence = sentences[sentences.length - 1]?.trim();
+      if (lastSentence) return lastSentence + ".";
+    }
+    return "Gracias por su mensaje. En breve nos pondremos en contacto con usted para atender su consulta.";
+  }
+  return msgContent.trim();
 }
 
 // ─── Registro en Supabase de mensajes respondidos ─────────────────────────────
@@ -254,10 +266,17 @@ async function main() {
           console.log(`   🤖 Respuesta IA: "${reply.substring(0, 80)}..."`);
 
           // Enviar respuesta via Graph API
+          // Obtener el ID del usuario (remitente del último mensaje)
+          const recipientId = lastMsg.from?.id;
+
           const result = await fbPost(
-            `${conv.id}/messages`,
+            `me/messages`,
             page.token,
-            { message: reply }
+            {
+              recipient: { id: recipientId },
+              message: { text: reply },
+              messaging_type: "RESPONSE"
+            }
           );
 
           if (result.error) {
