@@ -1,0 +1,28 @@
+name: FB AI Auto Responder
+
+on:
+  schedule:
+    # Corre cada 15 minutos (puedes cambiarlo a */5 para cada 5 min)
+    - cron: '*/15 * * * *'
+  workflow_dispatch: # permite correrlo manualmente desde GitHub
+
+jobs:
+  respond:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ejecutar responder
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: node scripts/responder.js
