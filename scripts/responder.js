@@ -5,7 +5,7 @@
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 const REPLIED_CACHE = new Set(); // evita responder dos veces en la misma ejecución
 
 // ─── Supabase helpers ─────────────────────────────────────────────────────────
@@ -125,52 +125,48 @@ function needsReply(conversation, pageId) {
   return true;
 }
 
-// ─── Gemini AI ────────────────────────────────────────────────────────────────
+// ─── OpenRouter AI (gratis con modelos gratuitos) ─────────────────────────────
 
 async function generateReply(userMessage, conversationHistory, negocio, paginaNombre) {
   const historyText = conversationHistory
-    .slice(0, 6) // últimos 6 mensajes para contexto
+    .slice(0, 6)
     .reverse()
     .map((m) => `${m.from?.name || "Usuario"}: ${m.message}`)
-    .join("\n");
+    .join("
+");
 
-  const prompt = `Eres el asistente virtual de la página de Facebook "${paginaNombre}".
-El negocio es: ${negocio}.
-
-INSTRUCCIONES:
-- Responde de forma amable, profesional y concisa (máximo 3 oraciones)
-- Responde siempre en el mismo idioma del mensaje del usuario
-- Si preguntan por precios o disponibilidad específica que no conoces, invítalos a contactar directamente
-- No inventes información sobre productos o servicios
-- Sé cálido y útil como un buen agente de atención al cliente
-- Si el mensaje es un saludo, responde con un saludo y pregunta en qué puedes ayudar
-- No menciones que eres una IA a menos que te lo pregunten directamente
-
-Historial de la conversación:
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${OPENROUTER_KEY}`,
+      "HTTP-Referer": "https://github.com/fb-ai-responder",
+      "X-Title": "FB AI Responder"
+    },
+    body: JSON.stringify({
+      model: "meta-llama/llama-3.3-70b-instruct:free",
+      max_tokens: 300,
+      messages: [
+        {
+          role: "system",
+          content: `Eres el asistente virtual de la página de Facebook "${paginaNombre}". El negocio es: ${negocio}. INSTRUCCIONES: Responde de forma amable, profesional y concisa (máximo 3 oraciones). Responde siempre en el mismo idioma del mensaje del usuario. Si preguntan por precios o disponibilidad específica que no conoces, invítalos a contactar directamente. No inventes información. Sé cálido y útil. Si es un saludo, responde con saludo y pregunta en qué puedes ayudar. No menciones que eres IA a menos que te lo pregunten.`
+        },
+        {
+          role: "user",
+          content: `Historial:
 ${historyText}
 
-Último mensaje del usuario: "${userMessage}"
+Último mensaje: "${userMessage}"
 
-Genera una respuesta apropiada.`;
-
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${GEMINI_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          maxOutputTokens: 300,
-          temperature: 0.7,
-        },
-      }),
-    }
-  );
+Responde:`
+        }
+      ]
+    })
+  });
 
   const data = await response.json();
-  if (data.error) throw new Error(`Gemini error: ${data.error.message}`);
-  return data.candidates[0].content.parts[0].text.trim();
+  if (data.error) throw new Error(`OpenRouter error: ${data.error.message}`);
+  return data.choices[0].message.content.trim();
 }
 
 // ─── Registro en Supabase de mensajes respondidos ─────────────────────────────
