@@ -117,10 +117,10 @@ function needsReply(conversation, pageId) {
   // Si el último mensaje lo envió la propia página, ya fue respondido
   if (String(lastMsg.from?.id) === String(pageId)) return false;
 
-  // Ignorar mensajes muy viejos (más de 7 días = 168 horas)
+  // Facebook solo permite responder dentro de 24h — usamos 23h como margen seguro
   const msgTime = new Date(lastMsg.created_time).getTime();
   const hoursOld = (Date.now() - msgTime) / (1000 * 60 * 60);
-  if (hoursOld > 168) return false;
+  if (hoursOld > 23) return false;
 
   return true;
 }
@@ -240,7 +240,7 @@ async function main() {
         const dbgLast = dbgMsgs[dbgMsgs.length - 1]; // más reciente = último
         const dbgRecent = dbgMsgs.slice(-3).map(m => `${m.from?.id}(${m.from?.name?.substring(0,10)})`).join(', ');
         const dbgAge = dbgLast ? Math.round((Date.now() - new Date(dbgLast.created_time)) / 3600000) : '?';
-        const dbgNeedsReply = String(dbgLast?.from?.id) !== String(page.pageId) && dbgAge <= 168;
+        const dbgNeedsReply = String(dbgLast?.from?.id) !== String(page.pageId) && dbgAge <= 23;
         console.log(`   🔍 Conv ${conv.id.substring(0,20)}... | recientes: [${dbgRecent}] | hace ${dbgAge}h | ${dbgNeedsReply ? '✅ PENDIENTE' : '⏭ skip'}`);
 
         if (!needsReply(conv, page.pageId)) continue;
