@@ -100,27 +100,34 @@ async function getConversations(pageId, token) {
 }
 
 /**
- * Verifica si el último mensaje en la conversación fue del usuario (no de la página)
- * Si el último mensaje es de la página misma, ya fue respondido
+ * Verifica si la conversación necesita respuesta:
+ * - El último mensaje debe ser del usuario (no de la página)
+ * - No debe haber sido procesada ya en esta ejecución
+ * - El mensaje no debe tener más de 48 horas
  */
 function needsReply(conversation, pageId) {
   const messages = conversation.messages?.data || [];
   if (messages.length === 0) return false;
 
-  // El más reciente viene primero
+  // Los mensajes vienen ordenados del más reciente al más antiguo
   const lastMsg = messages[0];
 
-  // Si el último mensaje lo envió la propia página, no necesita respuesta
-  if (lastMsg.from?.id === pageId) return false;
+  // Verificar si algún mensaje reciente fue enviado por la página (ya respondido)
+  // Revisamos los últimos 3 mensajes para detectar si la página ya respondió
+  const recentMessages = messages.slice(0, 3);
+  const pageAlreadyReplied = recentMessages.some(
+    (m) => String(m.from?.id) === String(pageId)
+  );
+  if (pageAlreadyReplied) return false;
 
   // Si ya lo procesamos en esta ejecución
   if (REPLIED_CACHE.has(conversation.id)) return false;
 
-  // Ignorar mensajes muy viejos (más de 24 horas)
+  // Ignorar mensajes muy viejos (más de 48 horas)
   const msgTime = new Date(lastMsg.created_time).getTime();
   const now = Date.now();
   const hoursOld = (now - msgTime) / (1000 * 60 * 60);
-  if (hoursOld > 24) return false;
+  if (hoursOld > 48) return false;
 
   return true;
 }
@@ -154,7 +161,7 @@ ${historyText}
 Genera una respuesta apropiada.`;
 
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -273,8 +280,8 @@ async function main() {
             await logReply(page.pageId, conv.id, userMessage, reply);
           }
 
-          // Pausa para no saturar las APIs
-          await new Promise((r) => setTimeout(r, 1500));
+          // Pausa entre mensajes para respetar rate limit de Gemini free tier
+          await new Promise((r) => setTimeout(r, 3000));
 
         } catch (e) {
           console.error(`   ❌ Error procesando conversación ${conv.id}:`, e.message);
@@ -285,6 +292,9 @@ async function main() {
       console.error(`   ❌ Error en página ${page.pageId}:`, e.message);
       totalErrors++;
     }
+
+    // Pausa entre páginas para no saturar Gemini
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
   console.log("\n" + "=".repeat(50));
