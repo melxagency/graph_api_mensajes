@@ -108,12 +108,15 @@ async function getConversations(pageId, token) {
  * La Graph API devuelve mensajes de más antiguo a más reciente,
  * por lo que el ÚLTIMO elemento del array es el mensaje más reciente.
  */
-function needsReply(conversation, pageId) {
+function needsReply(conversation, pageId, repliedSet) {
   const messages = conversation.messages?.data || [];
   if (messages.length === 0) return false;
 
-  // Si ya lo procesamos en esta ejecución
+  // Si ya lo procesamos en esta ejecución (cache en memoria)
   if (REPLIED_CACHE.has(conversation.id)) return false;
+
+  // Si ya fue respondido en una ejecución anterior (persistido en Supabase)
+  if (repliedSet.has(conversation.id)) return false;
 
   // El más reciente es el ÚLTIMO del array
   const lastMsg = messages[messages.length - 1];
@@ -127,6 +130,28 @@ function needsReply(conversation, pageId) {
   if (hoursOld > 23) return false;
 
   return true;
+}
+
+// ─── Control de conversaciones ya respondidas (Supabase) ─────────────────────
+
+/**
+ * Carga el set de conversation_id que ya fueron respondidos por la IA
+ * desde la tabla ai_replies_log en Supabase
+ */
+async function loadRepliedConversations() {
+  try {
+    // Traemos los conversation_id respondidos en las últimas 23 horas
+    const since = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
+    const data = await supabaseQuery(
+      `ai_replies_log?select=conversation_id&replied_at=gte.${since}`
+    );
+    const ids = new Set(data.map(r => r.conversation_id));
+    console.log(`✅ Conversaciones ya respondidas cargadas: ${ids.size}`);
+    return ids;
+  } catch (e) {
+    console.warn("⚠️  No se pudo cargar ai_replies_log:", e.message);
+    return new Set();
+  }
 }
 
 // ─── OpenRouter AI (gratis con modelos gratuitos) ─────────────────────────────
@@ -249,10 +274,13 @@ async function main() {
     return;
   }
 
+  // 2. Cargar conversaciones ya respondidas desde Supabase
+  const repliedSet = await loadRepliedConversations();
+
   let totalReplied = 0;
   let totalErrors = 0;
 
-  // 2. Procesar cada página
+  // 3. Procesar cada página
   for (const page of pages) {
     console.log(`\n📄 Procesando: ${page.nombrePagina} (${page.pageId})`);
     console.log(`   Negocio: ${page.negocio}`);
@@ -267,10 +295,10 @@ async function main() {
         const dbgLast = dbgMsgs[dbgMsgs.length - 1]; // más reciente = último
         const dbgRecent = dbgMsgs.slice(-3).map(m => `${m.from?.id}(${m.from?.name?.substring(0,10)})`).join(', ');
         const dbgAge = dbgLast ? Math.round((Date.now() - new Date(dbgLast.created_time)) / 3600000) : '?';
-        const dbgNeedsReply = String(dbgLast?.from?.id) !== String(page.pageId) && dbgAge <= 23;
+        const dbgNeedsReply = String(dbgLast?.from?.id) !== String(page.pageId) && dbgAge <= 23 && !repliedSet.has(conv.id) && !REPLIED_CACHE.has(conv.id);
         console.log(`   🔍 Conv ${conv.id.substring(0,20)}... | recientes: [${dbgRecent}] | hace ${dbgAge}h | ${dbgNeedsReply ? '✅ PENDIENTE' : '⏭ skip'}`);
 
-        if (!needsReply(conv, page.pageId)) continue;
+        if (!needsReply(conv, page.pageId, repliedSet)) continue;
 
         const messages = conv.messages?.data || [];
         const lastMsg = messages[messages.length - 1]; // más reciente = último
