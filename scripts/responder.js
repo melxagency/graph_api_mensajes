@@ -301,27 +301,43 @@ async function main() {
         if (!needsReply(conv, page.pageId, repliedSet)) continue;
 
         const messages = conv.messages?.data || [];
-        const lastMsg = messages[messages.length - 1]; // más reciente = último
-        const userMessage = lastMsg.message;
 
-        if (!userMessage || userMessage.trim() === "") continue;
+        // Encontrar índice del último mensaje enviado por la página
+        let lastPageMsgIndex = -1;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (String(messages[i].from?.id) === String(page.pageId)) {
+            lastPageMsgIndex = i;
+            break;
+          }
+        }
+
+        // Recopilar TODOS los mensajes del usuario después del último mensaje de la página
+        const pendingMsgs = [];
+        for (let i = lastPageMsgIndex + 1; i < messages.length; i++) {
+          const msg = messages[i];
+          const hoursOld = (Date.now() - new Date(msg.created_time)) / 3600000;
+          if (String(msg.from?.id) !== String(page.pageId) && msg.message?.trim() && hoursOld <= 23) {
+            pendingMsgs.push(msg);
+          }
+        }
+
+        if (pendingMsgs.length === 0) continue;
+
+        const lastMsg = pendingMsgs[pendingMsgs.length - 1];
+        const recipientId = lastMsg.from?.id;
+        const userName = lastMsg.from?.name;
+
+        // Combinar todos los mensajes pendientes para que la IA los analice juntos
+        const combinedMessage = pendingMsgs.map(m => m.message.trim()).join("\n");
 
         console.log(`\n   💬 Conversación: ${conv.id}`);
-        console.log(`   👤 Usuario: ${lastMsg.from?.name}`);
-        console.log(`   📝 Mensaje: "${userMessage.substring(0, 80)}..."`);
+        console.log(`   👤 Usuario: ${userName}`);
+        console.log(`   📝 Mensajes pendientes: ${pendingMsgs.length}`);
+        console.log(`   📝 Contenido: "${combinedMessage.substring(0, 120)}"`);
 
         try {
-          // Generar respuesta con Claude
-          const reply = await generateReply(
-            userMessage,
-            messages,
-            page
-          );
+          const reply = await generateReply(combinedMessage, messages, page);
           console.log(`   🤖 Respuesta IA: "${reply.substring(0, 80)}..."`);
-
-          // Enviar respuesta via Graph API
-          // Obtener el ID del usuario (remitente del último mensaje)
-          const recipientId = lastMsg.from?.id;
 
           const result = await fbPost(
             `me/messages`,
@@ -340,19 +356,16 @@ async function main() {
             console.log(`   ✅ Respuesta enviada (msg id: ${result.message_id})`);
             REPLIED_CACHE.add(conv.id);
             totalReplied++;
-
-            // Registrar en Supabase (opcional)
-            await logReply(page.pageId, conv.id, userMessage, reply);
+            await logReply(page.pageId, conv.id, combinedMessage, reply);
           }
 
-          // Pausa entre mensajes para respetar rate limit de Gemini free tier
           await new Promise((r) => setTimeout(r, 3000));
 
         } catch (e) {
           console.error(`   ❌ Error procesando conversación ${conv.id}:`, e.message);
           totalErrors++;
         }
-      }
+            }
     } catch (e) {
       console.error(`   ❌ Error en página ${page.pageId}:`, e.message);
       totalErrors++;
