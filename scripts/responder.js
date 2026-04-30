@@ -5,8 +5,9 @@
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const DEEPSEEK_KEY = process.env.DEEPSEEK_API_KEY;
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY;
 
+// Cache en memoria para evitar doble respuesta en la misma ejecución
 const REPLIED_CACHE = new Set();
 
 // ─── Supabase ─────────────────────────────────────────────────────────────────
@@ -37,6 +38,10 @@ async function supabaseInsert(table, body) {
   return res.ok;
 }
 
+/**
+ * Trae páginas activas con toda la info del cliente
+ * pages_services → pages + contratos_servicios → clientes
+ */
 async function getPagesWithContext() {
   const services = await supabaseQuery(
     `pages_services?select=id,id_pagina,id_contrato,contratos_servicios(id,id_cliente,clientes(id,cliente,negocio,contacto,email,contexto))&fecha_termino=is.null&order=id`
@@ -49,12 +54,13 @@ async function getPagesWithContext() {
   for (const p of pages) pagesMap[p.id] = p;
 
   const result = [];
-  const seenPageIds = new Set();
+  const seenPageIds = new Set(); // evitar duplicar misma página
 
   for (const svc of services) {
     const page = pagesMap[svc.id_pagina];
     if (!page?.token || !page?.id_page) continue;
 
+    // Saltar token expirado
     if (page.date_expire_token && new Date(page.date_expire_token) < new Date()) {
       console.warn(`   ⚠️  Token expirado: ${page.nombre}`);
       continue;
@@ -71,6 +77,7 @@ async function getPagesWithContext() {
       pageId: pageIdStr,
       token: page.token,
       nombrePagina: page.nombre,
+      clienteNombre: cliente?.cliente || "",
       negocio: cliente?.negocio || cliente?.cliente || "",
       contacto: cliente?.contacto || "",
       email: cliente?.email || "",
@@ -80,6 +87,10 @@ async function getPagesWithContext() {
   return result;
 }
 
+/**
+ * Carga Map de conversaciones ya respondidas: conversation_id → timestamp replied_at
+ * Solo las últimas 23h para comparar si el usuario escribió después
+ */
 async function loadRepliedMap() {
   try {
     const since = new Date(Date.now() - 23 * 60 * 60 * 1000).toISOString();
@@ -125,162 +136,150 @@ async function getConversations(pageId, token) {
   return data.data || [];
 }
 
-// ─── Analizar mensajes pendientes ─────────────────────────────────────────────
+// ─── Lógica de análisis de conversación ──────────────────────────────────────
 
-function getPendingMessages(conv, pageId, repliedMap) {
-  const messages = conv.messages?.data || [];
+/**
+ * Determina si una conversación necesita respuesta y devuelve
+ * los mensajes pendientes del usuario (escritos después de la última respuesta de la IA)
+ */
+function getPendingMessages(conversation, pageId, repliedMap) {
+  const messages = conversation.messages?.data || [];
   if (messages.length === 0) return null;
 
-  if (REPLIED_CACHE.has(conv.id)) return null;
+  // Skip si ya procesamos en esta ejecución
+  if (REPLIED_CACHE.has(conversation.id)) return null;
 
-  // El último mensaje debe ser del usuario (no de la página)
+  // El último mensaje del array es el más reciente
   const lastMsg = messages[messages.length - 1];
+
+  // Si el último mensaje es de la página, ya está respondido
   if (String(lastMsg.from?.id) === String(pageId)) return null;
 
-  // Debe estar dentro de la ventana de 23h
+  // Facebook solo permite responder en ventana de 24h (usamos 23h)
   const lastMsgTime = new Date(lastMsg.created_time).getTime();
-  if ((Date.now() - lastMsgTime) / 3600000 > 23) return null;
+  const hoursOld = (Date.now() - lastMsgTime) / 3600000;
+  if (hoursOld > 23) return null;
 
-  // Calcular desde cuándo hay mensajes nuevos del usuario
-  // Si ya respondimos antes, solo tomamos mensajes POSTERIORES a esa respuesta
+  // Determinar desde qué punto hay mensajes nuevos del usuario
+  // Si la IA ya respondió antes, buscar mensajes POSTERIORES a esa respuesta
   let cutoffTime = 0;
-  if (repliedMap.has(conv.id)) {
-    cutoffTime = repliedMap.get(conv.id);
-    if (lastMsgTime <= cutoffTime) return null; // no hay nada nuevo
+  if (repliedMap.has(conversation.id)) {
+    cutoffTime = repliedMap.get(conversation.id);
+    // Si el último mensaje del usuario es anterior o igual a la última respuesta → ya respondido
+    if (lastMsgTime <= cutoffTime) return null;
   }
 
-  // Filtrar mensajes del usuario posteriores al cutoff y dentro de 23h
+  // Recopilar mensajes del usuario posteriores al cutoff
   const pending = messages.filter(m => {
-    if (String(m.from?.id) === String(pageId)) return false;
-    if (!m.message?.trim()) return false;
+    if (String(m.from?.id) === String(pageId)) return false; // son de la página
+    if (!m.message?.trim()) return false; // vacíos
     const t = new Date(m.created_time).getTime();
-    if (t <= cutoffTime) return false;
-    if ((Date.now() - t) / 3600000 > 23) return false;
+    if (t <= cutoffTime) return false; // anteriores a última respuesta
+    const h = (Date.now() - t) / 3600000;
+    if (h > 23) return false; // fuera de ventana
     return true;
   });
 
-  return pending.length > 0 ? pending : null;
+  if (pending.length === 0) return null;
+  return pending;
 }
 
-// ─── Generar respuesta con IA ─────────────────────────────────────────────────
+// ─── IA: OpenRouter con modelo estable ───────────────────────────────────────
 
-async function generateReply(pending, allMessages, page) {
+async function generateReply(pendingMessages, allMessages, page) {
   const { nombrePagina, negocio, contacto, email, contexto, pageId } = page;
 
-  // Historial completo para contexto
+  // Construir historial completo como contexto (últimos 10 mensajes)
   const historial = allMessages
     .slice(-10)
     .map(m => {
-      const rol = String(m.from?.id) === String(pageId) ? "Negocio" : "Cliente";
-      return `${rol}: ${m.message}`;
+      const quien = String(m.from?.id) === String(pageId) ? "Página" : m.from?.name || "Cliente";
+      return `${quien}: ${m.message}`;
     })
     .join("\n");
 
-  // Mensajes nuevos del cliente sin respuesta
-  const nuevosMensajes = pending.map(m => m.message.trim()).join("\n");
+  // Mensajes pendientes que el usuario envió y aún no tienen respuesta
+  const mensajesPendientes = pendingMessages
+    .map(m => m.message.trim())
+    .join("\n");
 
   const contactoInfo = [
     contacto ? `WhatsApp: ${contacto}` : "",
     email ? `Email: ${email}` : "",
   ].filter(Boolean).join(" | ");
 
-  const system = `Eres el asistente de atención al cliente de "${nombrePagina}".
+  const systemPrompt = `Eres el asistente de atención al cliente de "${nombrePagina}".
 ${negocio ? `Negocio: ${negocio}.` : ""}
-${contactoInfo ? `Datos de contacto: ${contactoInfo}.` : ""}
+${contactoInfo ? `Contacto: ${contactoInfo}.` : ""}
 ${contexto ? `Información del negocio: ${contexto}.` : ""}
 
-REGLAS:
-- Escribe SOLO el mensaje para el cliente, sin razonamientos ni explicaciones
+REGLAS ESTRICTAS:
+- Responde ÚNICAMENTE con el mensaje para el cliente, sin explicaciones ni razonamientos
 - Máximo 3 oraciones, directo y amable
-- Mismo idioma que el cliente
-- Si pide contacto o WhatsApp, proporciona los datos disponibles
-- Si no tienes info específica, invita a contactar
-- NO inventes precios ni datos que no tengas`;
+- Usa el mismo idioma que el cliente
+- Si preguntan contacto o WhatsApp, proporciona los datos disponibles
+- Si no tienes información específica, invita a contactar por WhatsApp/email
+- NO inventes precios ni información que no tengas
+- NO escribas "Respuesta:", "AI:", ni nada similar, solo el texto del mensaje`;
 
-  const user = `Historial:
+  const userPrompt = `Historial de la conversación:
 ${historial}
 
-Nuevos mensajes del cliente sin respuesta:
-${nuevosMensajes}
+El cliente acaba de enviar estos mensajes nuevos que aún no tienen respuesta:
+${mensajesPendientes}
 
-Responde directamente al cliente:`;
+Escribe tu respuesta directamente:`;
 
-  const res = await fetch("https://api.deepseek.com/chat/completions", {
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${DEEPSEEK_KEY}`,
+      "Authorization": `Bearer ${OPENROUTER_KEY}`,
+      "HTTP-Referer": "https://github.com/fb-ai-responder",
+      "X-Title": "FB AI Responder",
     },
     body: JSON.stringify({
-      model: "deepseek-chat",
+      model: "google/gemma-3-12b-it:free",
       max_tokens: 200,
-      temperature: 0.3,
+      temperature: 0.4,
       messages: [
-        { role: "system", content: system },
-        { role: "user", content: user },
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
       ],
     }),
   });
 
-  const data = await res.json();
-  if (data.error) throw new Error(`DeepSeek: ${JSON.stringify(data.error)}`);
+  const data = await response.json();
 
-  let text = data.choices?.[0]?.message?.content?.trim();
-  if (!text) return "Gracias por su mensaje. En breve nos pondremos en contacto con usted.";
+  if (data.error) throw new Error(`OpenRouter: ${JSON.stringify(data.error)}`);
 
-  // Eliminar bloques de razonamiento que algunos modelos incluyen
-  // Patrones: <think>...</think>, [thinking]...[/thinking], líneas con "Wait", "Hmm", "Let me"
-  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
-  text = text.replace(/\[thinking\][\s\S]*?\[\/thinking\]/gi, "");
+  const text = data.choices?.[0]?.message?.content;
+  if (!text || text.trim() === "") {
+    return "Gracias por su mensaje. En breve nos pondremos en contacto con usted.";
+  }
 
-  // Si hay un separador claro como "---" o línea en blanco tras razonamiento, tomar lo de después
-  const separatorMatch = text.match(/(?:^|
-)[-─]{3,}
-([\s\S]+)$/);
-  if (separatorMatch) text = separatorMatch[1];
+  // Limpiar cualquier prefijo de razonamiento que pudiera colarse
+  const cleaned = text
+    .replace(/^(Respuesta:|AI:|Asistente:|Response:)\s*/i, "")
+    .replace(/^(Wait|No wait|Hmm|Let me|I think|Actually).{0,200}\n/gi, "")
+    .trim();
 
-  // Eliminar líneas que parezcan razonamiento interno
-  const lines = text.split("
-").filter(line => {
-    const l = line.trim().toLowerCase();
-    return !(
-      l.startsWith("wait") ||
-      l.startsWith("hmm") ||
-      l.startsWith("let me") ||
-      l.startsWith("i think") ||
-      l.startsWith("actually") ||
-      l.startsWith("no wait") ||
-      l.startsWith("okay") ||
-      l.startsWith("ok,") ||
-      l.startsWith("so,") ||
-      l.startsWith("the user") ||
-      l.startsWith("it mentions") ||
-      l.startsWith("i need to") ||
-      l.startsWith("i should") ||
-      l.match(/^[a-z].*thinking.*$/i)
-    );
-  });
-
-  text = lines.join("
-").trim();
-  if (!text) return "Gracias por su mensaje. En breve nos pondremos en contacto con usted.";
-
-  return text;
+  return cleaned;
 }
 
-// ─── Log ──────────────────────────────────────────────────────────────────────
+// ─── Log en Supabase ──────────────────────────────────────────────────────────
 
-async function logReply(pageId, convId, userMsg, reply) {
+async function logReply(pageId, conversationId, userMessage, reply) {
   try {
     await supabaseInsert("ai_replies_log", {
       page_id: pageId,
-      conversation_id: convId,
-      user_message: userMsg,
+      conversation_id: conversationId,
+      user_message: userMessage,
       ai_reply: reply,
       replied_at: new Date().toISOString(),
     });
   } catch (e) {
-    console.warn("⚠️  Log error:", e.message);
+    console.warn("⚠️  No se pudo guardar log:", e.message);
   }
 }
 
@@ -290,6 +289,7 @@ async function main() {
   console.log(`\n🤖 FB AI Responder — ${new Date().toISOString()}`);
   console.log("=".repeat(50));
 
+  // 1. Páginas activas
   let pages;
   try {
     pages = await getPagesWithContext();
@@ -299,12 +299,18 @@ async function main() {
     process.exit(1);
   }
 
-  if (!pages.length) return;
+  if (pages.length === 0) {
+    console.log("ℹ️  No hay páginas activas.");
+    return;
+  }
 
+  // 2. Cargar conversaciones ya respondidas (con timestamps)
   const repliedMap = await loadRepliedMap();
+
   let totalReplied = 0;
   let totalErrors = 0;
 
+  // 3. Procesar cada página
   for (const page of pages) {
     console.log(`\n📄 ${page.nombrePagina} (${page.pageId})`);
 
@@ -313,45 +319,51 @@ async function main() {
       console.log(`   Conversaciones: ${conversations.length}`);
 
       for (const conv of conversations) {
+        // Analizar si hay mensajes pendientes del usuario
         const pending = getPendingMessages(conv, page.pageId, repliedMap);
         if (!pending) continue;
 
-        const lastMsg = pending[pending.length - 1];
+        const lastUserMsg = pending[pending.length - 1];
+        const recipientId = lastUserMsg.from?.id;
+        const userName = lastUserMsg.from?.name;
         const combinedText = pending.map(m => m.message.trim()).join("\n");
+        const allMessages = conv.messages?.data || [];
 
         console.log(`\n   💬 ${conv.id}`);
-        console.log(`   👤 ${lastMsg.from?.name} (${pending.length} msg pendiente${pending.length > 1 ? "s" : ""})`);
-        console.log(`   📝 "${combinedText.substring(0, 120)}"`);
+        console.log(`   👤 ${userName} (${pending.length} mensaje${pending.length > 1 ? "s" : ""} pendiente${pending.length > 1 ? "s" : ""})`);
+        console.log(`   📝 "${combinedText.substring(0, 100)}"`);
 
         try {
-          const reply = await generateReply(pending, conv.messages?.data || [], page);
-          console.log(`   🤖 "${reply.substring(0, 120)}"`);
+          const reply = await generateReply(pending, allMessages, page);
+          console.log(`   🤖 "${reply.substring(0, 100)}"`);
 
           const result = await fbPost("me/messages", page.token, {
-            recipient: { id: lastMsg.from?.id },
+            recipient: { id: recipientId },
             message: { text: reply },
             messaging_type: "RESPONSE",
           });
 
           if (result.error) {
-            console.error(`   ❌ FB: ${result.error.message}`);
+            console.error(`   ❌ FB error: ${result.error.message}`);
             totalErrors++;
           } else {
             console.log(`   ✅ Enviado`);
             REPLIED_CACHE.add(conv.id);
+            // Actualizar el map en memoria para esta ejecución
             repliedMap.set(conv.id, Date.now());
             totalReplied++;
             await logReply(page.pageId, conv.id, combinedText, reply);
           }
 
           await new Promise(r => setTimeout(r, 2000));
+
         } catch (e) {
-          console.error(`   ❌ ${e.message}`);
+          console.error(`   ❌ Error: ${e.message}`);
           totalErrors++;
         }
       }
     } catch (e) {
-      console.error(`   ❌ Página ${page.pageId}: ${e.message}`);
+      console.error(`   ❌ Error página ${page.pageId}: ${e.message}`);
       totalErrors++;
     }
 
@@ -359,8 +371,12 @@ async function main() {
   }
 
   console.log("\n" + "=".repeat(50));
-  console.log(`✅ Enviadas: ${totalReplied} | ❌ Errores: ${totalErrors}`);
+  console.log(`✅ Respuestas enviadas: ${totalReplied}`);
+  console.log(`❌ Errores: ${totalErrors}`);
   console.log(`⏰ ${new Date().toISOString()}\n`);
 }
 
-main().catch(e => { console.error("Fatal:", e); process.exit(1); });
+main().catch(e => {
+  console.error("Error fatal:", e);
+  process.exit(1);
+});
