@@ -214,7 +214,7 @@ Responde directamente al cliente:`;
       "X-Title": "FB AI Responder",
     },
     body: JSON.stringify({
-      model: "meta-llama/llama-4-scout:free",
+      model: "openrouter/free",
       max_tokens: 200,
       temperature: 0.3,
       messages: [
@@ -227,7 +227,44 @@ Responde directamente al cliente:`;
   const data = await res.json();
   if (data.error) throw new Error(`OpenRouter: ${JSON.stringify(data.error)}`);
 
-  const text = data.choices?.[0]?.message?.content?.trim();
+  let text = data.choices?.[0]?.message?.content?.trim();
+  if (!text) return "Gracias por su mensaje. En breve nos pondremos en contacto con usted.";
+
+  // Eliminar bloques de razonamiento que algunos modelos incluyen
+  // Patrones: <think>...</think>, [thinking]...[/thinking], líneas con "Wait", "Hmm", "Let me"
+  text = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  text = text.replace(/\[thinking\][\s\S]*?\[\/thinking\]/gi, "");
+
+  // Si hay un separador claro como "---" o línea en blanco tras razonamiento, tomar lo de después
+  const separatorMatch = text.match(/(?:^|
+)[-─]{3,}
+([\s\S]+)$/);
+  if (separatorMatch) text = separatorMatch[1];
+
+  // Eliminar líneas que parezcan razonamiento interno
+  const lines = text.split("
+").filter(line => {
+    const l = line.trim().toLowerCase();
+    return !(
+      l.startsWith("wait") ||
+      l.startsWith("hmm") ||
+      l.startsWith("let me") ||
+      l.startsWith("i think") ||
+      l.startsWith("actually") ||
+      l.startsWith("no wait") ||
+      l.startsWith("okay") ||
+      l.startsWith("ok,") ||
+      l.startsWith("so,") ||
+      l.startsWith("the user") ||
+      l.startsWith("it mentions") ||
+      l.startsWith("i need to") ||
+      l.startsWith("i should") ||
+      l.match(/^[a-z].*thinking.*$/i)
+    );
+  });
+
+  text = lines.join("
+").trim();
   if (!text) return "Gracias por su mensaje. En breve nos pondremos en contacto con usted.";
 
   return text;
