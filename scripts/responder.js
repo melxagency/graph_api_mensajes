@@ -233,15 +233,12 @@ Responde directamente al cliente:`;
   text = text.replace(/<think>[\s\S]*?<\/think>/gi, "");
   text = text.replace(/\[thinking\][\s\S]*?\[\/thinking\]/gi, "");
 
-  // Si hay un separador claro como "---" o línea en blanco tras razonamiento, tomar lo de después
-  const separatorMatch = text.match(/(?:^|
-)[-─]{3,}
-([\s\S]+)$/);
+  // Si hay un separador claro como "---", tomar lo de después
+  const separatorMatch = text.match(/(?:^|\n)[-─]{3,}\n([\s\S]+)$/);
   if (separatorMatch) text = separatorMatch[1];
 
   // Eliminar líneas que parezcan razonamiento interno
-  const lines = text.split("
-").filter(line => {
+  const lines = text.split("\n").filter(line => {
     const l = line.trim().toLowerCase();
     return !(
       l.startsWith("wait") ||
@@ -261,8 +258,7 @@ Responde directamente al cliente:`;
     );
   });
 
-  text = lines.join("
-").trim();
+  text = lines.join("\n").trim();
   if (!text) return "Gracias por su mensaje. En breve nos pondremos en contacto con usted.";
 
   return text;
